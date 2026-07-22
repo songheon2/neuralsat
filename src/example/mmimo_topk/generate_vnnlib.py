@@ -40,6 +40,8 @@ import argparse
 import csv
 import pathlib
 
+from config import JNUNNV_HOME_PATH
+
 import numpy as np
 import onnxruntime as ort
 from data_split import test_row_range
@@ -48,7 +50,9 @@ from config import pickle_file_path
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 DEFAULT_NET = (
-    SCRIPT_DIR.parent
+    # SCRIPT_DIR.parent
+    pathlib.Path(JNUNNV_HOME_PATH)
+    / "models"
     / "onnx"
     / "Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID.onnx"
 )
