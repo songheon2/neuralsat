@@ -1,13 +1,27 @@
 import gurobipy as grb
 import multiprocessing
 import numpy as np
+import tempfile
 import time
 import sys
 import os
 
-MULTIPROCESS_MODEL = None
+# See the matching comment in solver_module.py: set once per *process*, via
+# _init_mip_worker (called from Pool(initializer=...) in each pool worker). A plain
+# module-global assigned in the parent right before creating the Pool doesn't reach
+# workers on platforms where multiprocessing defaults to 'spawn' (Windows always;
+# also fork-unsafe contexts elsewhere) -- spawned workers only see this module's
+# import-time default (None). Gurobi Model objects also aren't reliably picklable, so
+# the model is handed to each worker via a file path rather than through Pool's
+# (pickled) initargs or fork-shared state.
+_WORKER_MODEL = None
 REMOVE_UNUSED = True
 DEBUG = False
+
+
+def _init_mip_worker(model_path: str) -> None:
+    global _WORKER_MODEL
+    _WORKER_MODEL = grb.read(model_path)
 
 def _gurobi_error(message):
     print(f'Gurobi error: {message}')
@@ -114,7 +128,7 @@ def _mip_solver_worker(candidate):
         return vlb, refined, status_lb, status_lb_r
 
     refine_time = time.time()
-    model = MULTIPROCESS_MODEL.copy()
+    model = _WORKER_MODEL.copy()
     l_id, n_id, var_name, pre_relu_names, relu_names, final_name = candidate
     v = model.getVarByName(var_name)
     out_lb, out_ub = v.LB, v.UB
@@ -155,17 +169,25 @@ def _mip_solver_worker(candidate):
 
 
 def stabilize(self, mip_model, candidates, unified_lower_bounds, unified_upper_bounds, timeout):
-    global MULTIPROCESS_MODEL
-    MULTIPROCESS_MODEL = mip_model
-    MULTIPROCESS_MODEL.setParam('TimeLimit', timeout)
-    
+    mip_model.setParam('TimeLimit', timeout)
+
     # step 1: tightening
     solver_result = []
     if len(candidates):
-        with multiprocessing.Pool(min(len(candidates), os.cpu_count())) as pool:
-            solver_result = pool.map(_mip_solver_worker, candidates, chunksize=1)
-    MULTIPROCESS_MODEL = None
-    
+        fd, model_path = tempfile.mkstemp(suffix='.mps')
+        os.close(fd)
+        try:
+            mip_model.write(model_path)
+            with multiprocessing.Pool(
+                min(len(candidates), os.cpu_count()),
+                initializer=_init_mip_worker,
+                initargs=(model_path,),
+            ) as pool:
+                solver_result = pool.map(_mip_solver_worker, candidates, chunksize=1)
+        finally:
+            os.remove(model_path)
+
+
     # step 2: update refined bounds
     unified_lower_bounds_refined = {k: v.clone() for k, v in unified_lower_bounds.items()}
     unified_upper_bounds_refined = {k: v.clone() for k, v in unified_upper_bounds.items()}

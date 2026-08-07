@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 import multiprocessing
 import os
+import tempfile
 
 from .beta_crown import SparseBeta
 from .bound_ops import *
@@ -8,12 +9,25 @@ from .bound_ops import *
 if TYPE_CHECKING:
     from .bound_general import BoundedModule
 
-MULTIPROCESS_MODEL = None
+# Set once per *process* by _init_mip_worker (either directly in the parent for the
+# sequential fallback, or via Pool(initializer=...) in each pool worker). Not shared
+# across processes via fork's copy-on-write memory -- multiprocessing.Pool defaults to
+# 'spawn' on Windows, so a plain module-global assigned in the parent right before
+# creating the Pool (the old approach) is invisible to spawned workers, which only ever
+# see this module's import-time default (None). Gurobi Model objects aren't reliably
+# picklable either, so the model is handed to each worker via a file path instead of
+# directly through Pool's (pickled) initargs/global state.
+_WORKER_MODEL = None
 N_REFINE_LAYER = 3
 EAGER_OPTIMIZE = False
 N_PROC = os.cpu_count() // 2
 
 DEBUG = True
+
+
+def _init_mip_worker(model_path: str) -> None:
+    global _WORKER_MODEL
+    _WORKER_MODEL = grb.read(model_path)
 
 def build_solver_module(self: 'BoundedModule', x=None, C=None, interm_bounds=None,
                         final_node_name=None, model_type="mip", solver_pkg="gurobi",
@@ -101,8 +115,6 @@ def _build_solver_refined(self, x, node, C=None, model_type="mip", solver_pkg="g
         
         # refine from second relu layer
         if refine and isinstance(node, BoundRelu) and (node in self.relus[1:1+N_REFINE_LAYER]):
-            global MULTIPROCESS_MODEL
-            
             refine_node = node.inputs[0]
             assert len(refine_node.lower) == 1
             
@@ -137,17 +149,32 @@ def _build_solver_refined(self, x, node, C=None, model_type="mip", solver_pkg="g
                 if len(candidates):
                     if DEBUG:
                         print('#candidates =', len(candidates))
-                        
-                    MULTIPROCESS_MODEL = self.solver_model.copy()
-                    if (N_PROC > 1) and (len(candidates) > 1):
-                        with multiprocessing.Pool(min(N_PROC, len(candidates))) as pool:
-                            solver_result = pool.map(mip_solver_worker, candidates, chunksize=1)
-                    else:
-                        solver_result = []
-                        for can in candidates:
-                            solver_result.append(mip_solver_worker(can))
-                    MULTIPROCESS_MODEL = None
-                    
+
+                    # Gurobi models aren't picklable, so hand the model to worker
+                    # processes via a file on disk (see _init_mip_worker) rather than
+                    # through Pool's pickled initargs or a fork-shared global.
+                    fd, model_path = tempfile.mkstemp(suffix='.mps')
+                    os.close(fd)
+                    try:
+                        self.solver_model.write(model_path)
+                        if (N_PROC > 1) and (len(candidates) > 1):
+                            with multiprocessing.Pool(
+                                min(N_PROC, len(candidates)),
+                                initializer=_init_mip_worker,
+                                initargs=(model_path,),
+                            ) as pool:
+                                solver_result = pool.map(mip_solver_worker, candidates, chunksize=1)
+                        else:
+                            # No pool (nothing to spawn/fork into) -- load the model
+                            # into this same process so mip_solver_worker still finds
+                            # it via the same _WORKER_MODEL global.
+                            _init_mip_worker(model_path)
+                            solver_result = []
+                            for can in candidates:
+                                solver_result.append(mip_solver_worker(can))
+                    finally:
+                        os.remove(model_path)
+
                     # update bounds
                     for neuron_idx, vlb, vub, refined in solver_result:
                         if refined:
@@ -310,7 +337,7 @@ def mip_solver_worker(candidate):
     neuron_idx, var_name, timeout_per_neuron = candidate
     # print(f'Refining neuron={var_name}, timeout={timeout_per_neuron}')
     
-    model = MULTIPROCESS_MODEL.copy()
+    model = _WORKER_MODEL.copy()
     model.setParam('Threads', 1)
     if timeout_per_neuron is not None:
         model.setParam('TimeLimit', timeout_per_neuron)
